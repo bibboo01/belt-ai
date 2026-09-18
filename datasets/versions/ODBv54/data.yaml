@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 3
+names: ['dogear-belt', 'good-belt', 'splice-belt']
+
+roboflow:
+  workspace: testwork-5eqkp
+  project: objectdetectionbelt_quality
+  version: 54
+  license: Public Domain
+  url: https://universe.roboflow.com/testwork-5eqkp/objectdetectionbelt_quality/dataset/54

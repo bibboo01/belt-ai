@@ -1,0 +1,8 @@
+﻿{
+    "system": "Belt AI",
+    "model_id": 2,
+    "model_name": "YOLO11",
+    "model_version": "ODBv54",
+    "model_file": "best.pt",
+    "status": "TEST"
+}

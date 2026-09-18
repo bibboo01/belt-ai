@@ -1,0 +1,30 @@
+{
+    "system": "Belt AI",
+    "created_at": "2026-09-05T14:15:34.036007",
+    "models": [
+        {
+            "name": "best (yolo11_ODBv3).pt",
+            "path": "C:\\Users\\tanawong_k\\Desktop\\camera-ai\\belt-ai\\models\\staging\\best (yolo11_ODBv3).pt",
+            "size_mb": 18.37,
+            "task": "detect",
+            "classes": {
+                "0": "dogear-belt",
+                "1": "good-belt",
+                "2": "splice-belt"
+            },
+            "parameters": 9428953
+        },
+        {
+            "name": "best (yolo11_ODBv54).pt",
+            "path": "C:\\Users\\tanawong_k\\Desktop\\camera-ai\\belt-ai\\models\\staging\\best (yolo11_ODBv54).pt",
+            "size_mb": 38.8,
+            "task": "detect",
+            "classes": {
+                "0": "dogear-belt",
+                "1": "good-belt",
+                "2": "splice-belt"
+            },
+            "parameters": 20055321
+        }
+    ]
+}
