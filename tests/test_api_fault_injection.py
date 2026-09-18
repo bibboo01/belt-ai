@@ -1,10 +1,10 @@
-import io
-
 import numpy as np
-import pytest
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
+import app.detection_service as detection_service_module
 from app import main as main_module
 from app.main import app
 
@@ -28,6 +28,23 @@ TEST_IMAGE = "tests/sample.jpg"
 
 
 # ============================================================
+# SERVICE OBJECTS
+# ============================================================
+
+detection_service = (
+    detection_service_module.detection_service
+)
+
+service_repository = (
+    detection_service.repository
+)
+
+service_model_manager = (
+    detection_service.model_manager
+)
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -36,13 +53,13 @@ def post_detect(
     image_path=TEST_IMAGE,
 ):
     """
-    Send a multipart request to /api/v1/detect.
+    Send multipart request to /api/v1/detect.
     """
 
     with open(
         image_path,
         "rb",
-    ) as f:
+    ) as file:
 
         return client.post(
             "/api/v1/detect",
@@ -52,7 +69,7 @@ def post_detect(
             files={
                 "image": (
                     "sample.jpg",
-                    f,
+                    file,
                     "image/jpeg",
                 )
             },
@@ -78,7 +95,7 @@ def assert_error_contract(
     assert (
         data["status"]
         == "error"
-    )
+    ), data
 
     assert (
         data["code"]
@@ -88,11 +105,71 @@ def assert_error_contract(
     assert (
         "message"
         in data
-    )
+    ), data
 
     assert (
         "request_id"
         in data
+    ), data
+
+
+def bypass_model_registry(
+    monkeypatch,
+    model_version="FAULT-TEST",
+):
+    """
+    Bypass production model registry validation
+    so fault-injection tests can reach the intended
+    failure point.
+    """
+
+    def fake_validate_model_registry():
+        return {
+            "model_id": 2,
+            "model_name": "YOLO11",
+            "model_version": model_version,
+            "status": "PRODUCTION",
+        }
+
+    monkeypatch.setattr(
+        detection_service,
+        "_validate_model_registry",
+        fake_validate_model_registry,
+    )
+
+    monkeypatch.setattr(
+        service_model_manager,
+        "get_info",
+        lambda: {
+            "model_id": 2,
+            "model_name": "YOLO11",
+            "model_version": model_version,
+            "status": "PRODUCTION",
+        },
+    )
+
+
+def create_successful_inference_result():
+    """
+    Create fake successful inference result
+    matching the current DetectionService contract.
+    """
+
+    return SimpleNamespace(
+        detections=[
+            {
+                "class_id": 2,
+                "class_name": "splice-belt",
+                "confidence": 0.95,
+                "bbox": [
+                    100,
+                    100,
+                    500,
+                    500,
+                ],
+            }
+        ],
+        inference_time_ms=12.34,
     )
 
 
@@ -107,24 +184,38 @@ def test_api_16_model_not_ready(
     """
     API-16
 
-    Simulate model manager reporting
-    that the model is not ready.
+    Simulate:
+
+        Model Manager
+            ↓
+        Model not ready
+
+    Expected:
+
+        HTTP 503
+        MODEL_NOT_READY
     """
 
     # --------------------------------------------------------
-    # Model unavailable
+    # Prevent load_model() from making the model ready
     # --------------------------------------------------------
 
     monkeypatch.setattr(
-        main_module.model_manager,
-        "get_model",
+        service_model_manager,
+        "load_model",
         lambda: None,
     )
 
     monkeypatch.setattr(
-        main_module.model_manager,
+        service_model_manager,
         "is_ready",
         lambda: False,
+    )
+
+    monkeypatch.setattr(
+        service_model_manager,
+        "get_model",
+        lambda: None,
     )
 
     # --------------------------------------------------------
@@ -155,66 +246,53 @@ def test_api_17_model_not_registered(
     """
     API-17
 
-    Simulate a valid loaded model but
-    the model is missing from the database registry.
+    Simulate:
+
+        Model ready
+            ↓
+        Registry lookup
+            ↓
+        No registered model
+
+    Expected:
+
+        HTTP 503
+        MODEL_NOT_REGISTERED
     """
 
-    # ========================================================
-    # Fake model
-    # ========================================================
-
-    class FakeModel:
-
-        names = {
-            0: "dogear-belt",
-            1: "good-belt",
-            2: "splice-belt",
-        }
-
-    fake_model = FakeModel()
-
     # --------------------------------------------------------
-    # Model manager
+    # Model ready
     # --------------------------------------------------------
 
     monkeypatch.setattr(
-        main_module.model_manager,
-        "get_model",
-        lambda: fake_model,
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
+        service_model_manager,
         "is_ready",
         lambda: True,
     )
 
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_name",
-        "YOLO11",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_version",
-        "FAULT-TEST",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "confidence",
-        0.5,
-    )
-
     # --------------------------------------------------------
-    # Model registry returns nothing
+    # Deterministic model info
     # --------------------------------------------------------
 
     monkeypatch.setattr(
-        main_module.repository,
+        service_model_manager,
+        "get_info",
+        lambda: {
+            "model_id": 2,
+            "model_name": "YOLO11",
+            "model_version": "FAULT-TEST",
+            "status": "PRODUCTION",
+        },
+    )
+
+    # --------------------------------------------------------
+    # Registry returns nothing
+    # --------------------------------------------------------
+
+    monkeypatch.setattr(
+        service_repository,
         "get_model_version",
-        lambda **kwargs: None,
+        lambda *args, **kwargs: None,
     )
 
     # --------------------------------------------------------
@@ -245,80 +323,45 @@ def test_api_18_inference_failed(
     """
     API-18
 
-    Simulate model inference failure.
+    Simulate:
+
+        Model Registry OK
+            ↓
+        Inference
+            ↓
+        RuntimeError
+
+    Expected:
+
+        HTTP 500
+        INFERENCE_FAILED
     """
 
-    # ========================================================
-    # Fake model
-    # ========================================================
-
-    class FakeModel:
-
-        names = {
-            0: "dogear-belt",
-            1: "good-belt",
-            2: "splice-belt",
-        }
-
-        def predict(
-            self,
-            source,
-            conf,
-            verbose,
-        ):
-
-            raise RuntimeError(
-                "SIMULATED_INFERENCE_FAILURE"
-            )
-
-    fake_model = FakeModel()
-
     # --------------------------------------------------------
-    # Model manager
+    # Bypass model registry
     # --------------------------------------------------------
 
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "get_model",
-        lambda: fake_model,
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "is_ready",
-        lambda: True,
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_name",
-        "YOLO11",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_version",
-        "FAULT-TEST",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "confidence",
-        0.5,
+    bypass_model_registry(
+        monkeypatch,
+        model_version="FAULT-TEST",
     )
 
     # --------------------------------------------------------
-    # Model registry
+    # Force inference failure
     # --------------------------------------------------------
 
+    def fake_run_inference(
+        frame,
+        model_manager,
+    ):
+        raise RuntimeError(
+            "SIMULATED_INFERENCE_FAILURE"
+        )
+
     monkeypatch.setattr(
-        main_module.repository,
-        "get_model_version",
-        lambda **kwargs: {
-            "model_id": 2,
-            "model_name": "YOLO11",
-            "model_version": "FAULT-TEST",
-        },
+        detection_service_module,
+        "run_inference",
+        fake_run_inference,
     )
 
     # --------------------------------------------------------
@@ -351,9 +394,11 @@ def test_api_19_database_transaction_failed(
 
     Simulate:
 
-        Model inference
+        Model Registry OK
             ↓
-        Detection parsing
+        Inference OK
+            ↓
+        Detection parsing OK
             ↓
         Database transaction
             ↓
@@ -366,176 +411,69 @@ def test_api_19_database_transaction_failed(
         Image recovery attempt
     """
 
-    # ========================================================
-    # Fake YOLO Box
-    # ========================================================
+    # --------------------------------------------------------
+    # Bypass model registry
+    # --------------------------------------------------------
+
+    bypass_model_registry(
+        monkeypatch,
+        model_version="FAULT-TEST",
+    )
+
+    # --------------------------------------------------------
+    # Successful fake inference
+    # --------------------------------------------------------
+
+    fake_inference_result = (
+        create_successful_inference_result()
+    )
+
+    def fake_run_inference(
+        frame,
+        model_manager,
+    ):
+        return fake_inference_result
+
+    monkeypatch.setattr(
+        detection_service_module,
+        "run_inference",
+        fake_run_inference,
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT
     #
-    # IMPORTANT:
+    # Patch the repository used by DetectionService itself.
     #
-    # main.py uses:
+    # The previous test patched:
     #
-    #   box.cls[0]
-    #   box.conf[0]
-    #   box.xyxy[0].tolist()
+    #     main_module.repository.begin
     #
-    # Therefore all values must be NumPy arrays.
-    # ========================================================
-
-    class FakeBox:
-
-        def __init__(self):
-
-            self.cls = np.array(
-                [2]
-            )
-
-            self.conf = np.array(
-                [0.95]
-            )
-
-            self.xyxy = np.array(
-                [
-                    [
-                        100,
-                        100,
-                        500,
-                        500,
-                    ]
-                ]
-            )
-
-    # ========================================================
-    # Fake YOLO Boxes
-    # ========================================================
-
-    class FakeBoxes:
-
-        def __iter__(self):
-
-            return iter(
-                [
-                    FakeBox()
-                ]
-            )
-
-    # ========================================================
-    # Fake YOLO Result
-    # ========================================================
-
-    class FakeResult:
-
-        def __init__(self):
-
-            self.boxes = FakeBoxes()
-
-        def plot(self):
-
-            return np.zeros(
-                (
-                    1080,
-                    1920,
-                    3,
-                ),
-                dtype=np.uint8,
-            )
-
-    # ========================================================
-    # Fake YOLO Model
-    # ========================================================
-
-    class FakeModel:
-
-        names = {
-            0: "dogear-belt",
-            1: "good-belt",
-            2: "splice-belt",
-        }
-
-        def predict(
-            self,
-            source,
-            conf,
-            verbose,
-        ):
-
-            return [
-                FakeResult()
-            ]
-
-    fake_model = FakeModel()
-
-    # ========================================================
-    # Model Manager
-    # ========================================================
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "get_model",
-        lambda: fake_model,
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "is_ready",
-        lambda: True,
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_name",
-        "YOLO11",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "model_version",
-        "FAULT-TEST",
-    )
-
-    monkeypatch.setattr(
-        main_module.model_manager,
-        "confidence",
-        0.5,
-    )
-
-    # ========================================================
-    # Model Registry
-    # ========================================================
-
-    monkeypatch.setattr(
-        main_module.repository,
-        "get_model_version",
-        lambda **kwargs: {
-            "model_id": 2,
-            "model_name": "YOLO11",
-            "model_version": "FAULT-TEST",
-        },
-    )
-
-    # ========================================================
-    # Force Database Transaction Failure
-    # ========================================================
+    # but DetectionService uses:
+    #
+    #     detection_service.repository.begin
+    #
+    # --------------------------------------------------------
 
     def fake_begin():
-
         raise SQLAlchemyError(
             "SIMULATED_DATABASE_FAILURE"
         )
 
     monkeypatch.setattr(
-        main_module.repository,
+        service_repository,
         "begin",
         fake_begin,
     )
 
-    # ========================================================
-    # Capture ERROR Status Update
-    # ========================================================
+    # --------------------------------------------------------
+    # Track ERROR recovery
+    # --------------------------------------------------------
 
     status_updates = []
 
     original_update = (
-        main_module.repository
+        service_repository
         .update_image_processed
     )
 
@@ -545,7 +483,6 @@ def test_api_19_database_transaction_failed(
         inference_time_ms=None,
         result_path=None,
     ):
-
         status_updates.append(
             {
                 "image_id": image_id,
@@ -556,27 +493,25 @@ def test_api_19_database_transaction_failed(
         return original_update(
             image_id=image_id,
             status=status,
-            inference_time_ms=(
-                inference_time_ms
-            ),
+            inference_time_ms=inference_time_ms,
             result_path=result_path,
         )
 
     monkeypatch.setattr(
-        main_module.repository,
+        service_repository,
         "update_image_processed",
         tracking_update,
     )
 
-    # ========================================================
+    # --------------------------------------------------------
     # Request
-    # ========================================================
+    # --------------------------------------------------------
 
     response = post_detect()
 
-    # ========================================================
-    # Validate API Error Contract
-    # ========================================================
+    # --------------------------------------------------------
+    # Validate API error
+    # --------------------------------------------------------
 
     assert_error_contract(
         response=response,
@@ -584,19 +519,130 @@ def test_api_19_database_transaction_failed(
         expected_code="DATABASE_ERROR",
     )
 
-    # ========================================================
-    # Validate ERROR Recovery
-    # ========================================================
+    # --------------------------------------------------------
+    # Validate ERROR recovery
+    # --------------------------------------------------------
 
     assert len(
         status_updates
     ) >= 1
 
     assert any(
-        update["status"]
-        == "ERROR"
+        update["status"] == "ERROR"
         for update in status_updates
     )
+
+
+# ============================================================
+# API-19 EXTRA
+# NO DETECTION SHOULD BE COMMITTED
+# ============================================================
+
+def test_api_19_no_detection_when_transaction_fails(
+    monkeypatch,
+):
+    """
+    Additional transaction rollback verification.
+
+    Expected:
+
+        HTTP 500
+        DATABASE_ERROR
+    """
+
+    # --------------------------------------------------------
+    # Bypass model registry
+    # --------------------------------------------------------
+
+    bypass_model_registry(
+        monkeypatch,
+        model_version="FAULT-TEST-NO-DETECTION",
+    )
+
+    # --------------------------------------------------------
+    # Successful fake inference
+    # --------------------------------------------------------
+
+    fake_inference_result = (
+        create_successful_inference_result()
+    )
+
+    monkeypatch.setattr(
+        detection_service_module,
+        "run_inference",
+        lambda frame, model_manager:
+            fake_inference_result,
+    )
+
+    # --------------------------------------------------------
+    # Track image creation
+    # --------------------------------------------------------
+
+    created_image_ids = []
+
+    original_create_image = (
+        service_repository
+        .create_image
+    )
+
+    def tracking_create_image(
+        **kwargs,
+    ):
+        image_id = original_create_image(
+            **kwargs
+        )
+
+        created_image_ids.append(
+            image_id
+        )
+
+        return image_id
+
+    monkeypatch.setattr(
+        service_repository,
+        "create_image",
+        tracking_create_image,
+    )
+
+    # --------------------------------------------------------
+    # Force transaction failure
+    # --------------------------------------------------------
+
+    def fake_begin():
+        raise SQLAlchemyError(
+            "SIMULATED_TRANSACTION_ROLLBACK"
+        )
+
+    monkeypatch.setattr(
+        service_repository,
+        "begin",
+        fake_begin,
+    )
+
+    # --------------------------------------------------------
+    # Request
+    # --------------------------------------------------------
+
+    response = post_detect()
+
+    # --------------------------------------------------------
+    # Validate API
+    # --------------------------------------------------------
+
+    assert_error_contract(
+        response=response,
+        expected_status=500,
+        expected_code="DATABASE_ERROR",
+    )
+
+    # --------------------------------------------------------
+    # Image record should exist because it is created
+    # before the final transaction.
+    # --------------------------------------------------------
+
+    assert len(
+        created_image_ids
+    ) >= 1
 
 
 # ============================================================
@@ -606,9 +652,6 @@ def test_api_19_database_transaction_failed(
 def test_fault_injection_summary():
     """
     Summary marker.
-
-    The actual validation is performed by
-    API-16 through API-19.
     """
 
     assert True

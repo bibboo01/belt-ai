@@ -13,6 +13,7 @@ from app.database.repository import repository
 from app.errors import BeltAIError
 from app.inference import run_inference
 from app.model_manager import model_manager
+from sqlalchemy.exc import SQLAlchemyError
 
 
 # ============================================================
@@ -662,10 +663,21 @@ class DetectionService:
             # 7. Run AI Inference
             # =================================================
 
-            inference_result = run_inference(
-                frame=frame,
-                model_manager=self.model_manager,
-            )
+            try:
+                inference_result = run_inference(
+                    frame=frame,
+                    model_manager=self.model_manager,
+                )
+
+            except BeltAIError:
+                raise
+
+            except Exception as exc:
+                raise BeltAIError(
+                    status_code=500,
+                    code="INFERENCE_FAILED",
+                    message="Inference failed",
+                ) from exc
 
             detections = (
                 inference_result.detections
@@ -802,61 +814,69 @@ class DetectionService:
             # If anything fails, transaction rolls back.
             # =================================================
 
-            with self.repository.begin() as connection:
+            try:
+                with self.repository.begin() as connection:
 
-                # ---------------------------------------------
-                # Insert detections
-                # ---------------------------------------------
+                    # -----------------------------------------------------
+                    # Insert detections
+                    # -----------------------------------------------------
 
-                for detection in detections:
+                    for detection in detections:
 
-                    bbox = detection["bbox"]
+                        bbox = detection["bbox"]
 
-                    self.repository.create_detection_tx(
+                        self.repository.create_detection_tx(
+                            connection=connection,
+                            image_id=image_id,
+                            model_id=int(
+                                registry["model_id"]
+                            ),
+                            class_id=int(
+                                detection["class_id"]
+                            ),
+                            class_name=str(
+                                detection["class_name"]
+                            ),
+                            confidence=float(
+                                detection["confidence"]
+                            ),
+                            x1=int(bbox[0]),
+                            y1=int(bbox[1]),
+                            x2=int(bbox[2]),
+                            y2=int(bbox[3]),
+                        )
+
+                    # -----------------------------------------------------
+                    # Insert inspection result
+                    # -----------------------------------------------------
+
+                    self.repository.create_inspection_result_tx(
                         connection=connection,
                         image_id=image_id,
-                        model_id=int(
-                            registry["model_id"]
-                        ),
-                        class_id=int(
-                            detection["class_id"]
-                        ),
-                        class_name=str(
-                            detection["class_name"]
-                        ),
-                        confidence=float(
-                            detection["confidence"]
-                        ),
-                        x1=int(bbox[0]),
-                        y1=int(bbox[1]),
-                        x2=int(bbox[2]),
-                        y2=int(bbox[3]),
+                        good_count=good_count,
+                        splice_count=splice_count,
+                        dogear_count=dogear_count,
+                        overall_result=overall_result,
                     )
 
-                # ---------------------------------------------
-                # Insert inspection result
-                # ---------------------------------------------
+                    # -----------------------------------------------------
+                    # Mark image DONE
+                    # -----------------------------------------------------
 
-                self.repository.create_inspection_result_tx(
-                    connection=connection,
-                    image_id=image_id,
-                    good_count=good_count,
-                    splice_count=splice_count,
-                    dogear_count=dogear_count,
-                    overall_result=overall_result,
-                )
+                    self.repository.update_image_processed_tx(
+                        connection=connection,
+                        image_id=image_id,
+                        status="DONE",
+                        inference_time_ms=inference_time_ms,
+                        result_path=result_path_db,
+                    )
 
-                # ---------------------------------------------
-                # Mark DONE + result path
-                # ---------------------------------------------
-
-                self.repository.update_image_processed_tx(
-                    connection=connection,
-                    image_id=image_id,
-                    status="DONE",
-                    inference_time_ms=inference_time_ms,
-                    result_path=result_path_db,
-                )
+            except SQLAlchemyError as exc:
+                raise BeltAIError(
+                    status_code=500,
+                    code="DATABASE_ERROR",
+                    message="Database transaction failed",
+                ) from exc
 
             # =================================================
             # 13. Request Time
